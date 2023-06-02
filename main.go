@@ -1,3 +1,4 @@
+// Package main provides a Kubernetes sidecar that performs leader election.
 package main
 
 import (
@@ -95,13 +96,20 @@ func updateStatus(status string) {
 	if err != nil {
 		panic(err.Error())
 	}
-	defer f.Close()
+
+	defer func() {
+		if err := f.Close(); err != nil {
+			fmt.Printf("failed to close file: %v", err)
+		}
+	}()
 
 	_, err = f.WriteString(status)
 	if err != nil {
 		panic(err.Error())
 	}
-	f.Sync()
+	if err := f.Sync(); err != nil {
+		fmt.Printf("failed to sync file: %v", err)
+	}
 }
 
 func removeStatusFile() {
