@@ -5,6 +5,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,8 +17,6 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
-
-const leaderStatusFile = "/tmp/leader_status"
 
 func main() {
 	// Get in-cluster config
@@ -38,9 +39,9 @@ func main() {
 		panic(err.Error())
 	}
 
-	id, err := os.Hostname()
-	if err != nil {
-		panic(err.Error())
+	id, exists := os.LookupEnv("MYID")
+	if !exists {
+		panic("aaaaa")
 	}
 
 	// Get lease and namespace from environment variables
@@ -66,54 +67,70 @@ func main() {
 		},
 	}
 
+	// Create a context that we can cancel for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Track leadership status
+	var isLeader bool
+	var leaderMutex sync.Mutex
+
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start signal handler in a separate goroutine
+	go func() {
+		sig := <-sigChan
+		fmt.Printf("Received signal %v, initiating graceful shutdown...\n", sig)
+
+		// Check if we're the current leader before releasing the lease
+		leaderMutex.Lock()
+		if isLeader {
+			fmt.Printf("Releasing lease as current leader...\n")
+			// Release the lease by deleting it
+			err := clientset.CoordinationV1().Leases(namespace).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
+			if err != nil {
+				fmt.Printf("Failed to release lease: %v\n", err)
+			} else {
+				fmt.Printf("Lease released successfully\n")
+			}
+		}
+		leaderMutex.Unlock()
+
+		cancel() // Cancel the context to stop leader election
+	}()
+
 	// Try and become the leader
-	leaderelection.RunOrDie(context.TODO(), leaderelection.LeaderElectionConfig{
+	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:          lock,
-		LeaseDuration: 15 * time.Second,
-		RenewDeadline: 10 * time.Second,
-		RetryPeriod:   2 * time.Second,
+		LeaseDuration: 5 * time.Second,
+		RenewDeadline: 1 * time.Second,
+		RetryPeriod:   100 * time.Millisecond,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				// we're now the leader
-				updateStatus(id)
+				leaderMutex.Lock()
+				isLeader = true
+				leaderMutex.Unlock()
+				fmt.Printf("Started leading with identity: %s\n", id)
 			},
 			OnStoppedLeading: func() {
 				// we are not the leader anymore
-				removeStatusFile()
+				leaderMutex.Lock()
+				isLeader = false
+				leaderMutex.Unlock()
+				fmt.Printf("Stopped leading\n")
 			},
 			OnNewLeader: func(identity string) {
 				// we observe a new leader
 				if identity != id {
-					removeStatusFile()
+					leaderMutex.Lock()
+					isLeader = false
+					leaderMutex.Unlock()
+					fmt.Printf("New leader elected: %s\n", identity)
 				}
 			},
 		},
 	})
-}
-
-func updateStatus(status string) {
-	f, err := os.Create(leaderStatusFile)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	defer func() {
-		if err := f.Close(); err != nil {
-			fmt.Printf("failed to close file: %v", err)
-		}
-	}()
-
-	_, err = f.WriteString(status)
-	if err != nil {
-		panic(err.Error())
-	}
-	if err := f.Sync(); err != nil {
-		fmt.Printf("failed to sync file: %v", err)
-	}
-}
-
-func removeStatusFile() {
-	if err := os.Remove(leaderStatusFile); err != nil {
-		fmt.Printf("failed to remove %s, error: %s", leaderStatusFile, err)
-	}
 }
