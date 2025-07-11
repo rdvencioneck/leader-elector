@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -39,9 +41,9 @@ func main() {
 		panic(err.Error())
 	}
 
-	id, exists := os.LookupEnv("MYID")
+	id, exists := os.LookupEnv("LEADER_ID")
 	if !exists {
-		panic("aaaaa")
+		panic("LEADER_ID not set")
 	}
 
 	// Get lease and namespace from environment variables
@@ -75,6 +77,35 @@ func main() {
 	var isLeader bool
 	var leaderMutex sync.Mutex
 
+	// Setup HTTP server for leadership status
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		leaderMutex.Lock()
+		currentlyLeader := isLeader
+		leaderMutex.Unlock()
+
+		if currentlyLeader {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "Leader: %s\n", id)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, "Not leader\n")
+		}
+	})
+
+	// Get port from environment variable
+	port, exists := os.LookupEnv("PORT")
+	if !exists {
+		port = "8080" // default port
+	}
+
+	// Start HTTP server in background
+	go func() {
+		log.Printf("Starting HTTP server on port %s...", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -82,18 +113,18 @@ func main() {
 	// Start signal handler in a separate goroutine
 	go func() {
 		sig := <-sigChan
-		fmt.Printf("Received signal %v, initiating graceful shutdown...\n", sig)
+		log.Printf("Received signal %v, initiating graceful shutdown...", sig)
 
 		// Check if we're the current leader before releasing the lease
 		leaderMutex.Lock()
 		if isLeader {
-			fmt.Printf("Releasing lease as current leader...\n")
+			log.Printf("Releasing lease as current leader...")
 			// Release the lease by deleting it
 			err := clientset.CoordinationV1().Leases(namespace).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
 			if err != nil {
-				fmt.Printf("Failed to release lease: %v\n", err)
+				log.Printf("Failed to release lease: %v", err)
 			} else {
-				fmt.Printf("Lease released successfully\n")
+				log.Printf("Lease released successfully")
 			}
 		}
 		leaderMutex.Unlock()
@@ -113,14 +144,14 @@ func main() {
 				leaderMutex.Lock()
 				isLeader = true
 				leaderMutex.Unlock()
-				fmt.Printf("Started leading with identity: %s\n", id)
+				log.Printf("Started leading with identity: %s", id)
 			},
 			OnStoppedLeading: func() {
 				// we are not the leader anymore
 				leaderMutex.Lock()
 				isLeader = false
 				leaderMutex.Unlock()
-				fmt.Printf("Stopped leading\n")
+				log.Printf("Stopped leading")
 			},
 			OnNewLeader: func(identity string) {
 				// we observe a new leader
@@ -128,7 +159,7 @@ func main() {
 					leaderMutex.Lock()
 					isLeader = false
 					leaderMutex.Unlock()
-					fmt.Printf("New leader elected: %s\n", identity)
+					log.Printf("New leader elected: %s", identity)
 				}
 			},
 		},
